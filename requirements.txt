@@ -1,0 +1,9 @@
+python-telegram-bot
+Flask
+aiohttp
+numpy
+python-dotenv
+supabase
+python-dateutil
+binance-connector
+pandas

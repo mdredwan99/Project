@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: crypto-signal-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    pythonVersion: 3.10.12
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: 7755345858:AAHW8cFnUjhcKPz1UOqXXrz442anBFITpuU
+      - key: SUPABASE_URL
+        value: https://mwuzynrtrnfmxxwqspkj.supabase.co
+      - key: SUPABASE_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13dXp5bnJ0cm5mbXh4d3FzcGtqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NDcxOTAwNCwiZXhwIjoyMDcwMjk1MDA0fQ.v19APsbxmGPBm_SCCu07TrohlJ9KAAkCkvzFfActWVc
+     
