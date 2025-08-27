@@ -13,175 +13,24 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 from config_and_utils import (
     logger, keep_alive, bot, USER_TZ, CHAT_ID, SLEEP_TIME,
-    MAX_CONCURRENCY, REQUEST_TIMEOUT, AUTO_ADD_NEW_COINS,
+    MAX_CONCURRENCY, REQUEST_TIMEOUT,
     get_username, is_admin, parse_command, now_telegram_str, mark_alert
 )
 import data_api
 from data_api import (
     get_top_gainers, get_ticker_24h, get_exchange_info,
     get_column, add_coin, add_coin_with_date, remove_coin_from_table, get_removed_map,
-    fetch_signals_since, log_to_supabase, parse_ohlcv  # keep for parity with old
+    fetch_signals_since, log_to_supabase
 )
-from analysis import detect_signals, volatility_coin_list
-from fvg_coinlist import fvg_coinlist_handler  # New feature handler
+from fvg_coinlist import fvg_coinlist_handler, get_fvg_coins_async  # use fvg-only filtering
 
 log = logging.getLogger("main")
-
-# When True, normal scanning pauses while FVG scan runs
-FVG_SCAN_RUNNING: bool = False
 
 # ===================== Helpers =====================
 def chunked(lst: List[Any], n: int):
     """Yield successive n-sized chunks from list."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
-# ===================== Alerts & send =====================
-async def format_status(symbol: str) -> str:
-    """Return human label for coin's status."""
-    watchlist = await get_column("watchlist")
-    haram = await get_column("haram")
-    removed_map = await get_removed_map()
-    s = symbol.upper()
-    if s in haram:
-        return "HARAM ⚠️"
-    if s in removed_map:
-        return f"REMOVED {removed_map[s]}"
-    if s in watchlist:
-        return "WATCHLIST ✅"
-    return "NEW 🚀"
-
-async def send_alert(symbol: str, reasons_by_tf: Dict[str, List[str]], final_opinion: str, profiles: List[str]):
-    """Send a formatted alert to Telegram and log to Supabase."""
-    timestamp = now_telegram_str()  # Telegram messages use USER_TZ (UTC+6)
-    status_text = await format_status(symbol)
-    pct24 = await get_ticker_24h(symbol)
-    pct_str = f"{pct24:+.2f}%" if pct24 is not None else "N/A"
-
-    def tf_line(tf: str) -> str:
-        r = reasons_by_tf.get(tf, [])
-        return f"{tf}: " + (" + ".join(r) if r else "No Signal")
-
-    prof_line = ("Profiles: " + ", ".join(profiles)) if profiles else "Profiles: —"
-
-    message = (
-        "🚨 *Bullish Signal Detected!*\n"
-        f"Coin: `{symbol}`\n"
-        f"Status: {status_text}\n"
-        f"Time: {timestamp}\n"
-        f"24h Change: {pct_str}\n"
-        "---------------------------------\n"
-        f"{tf_line('15m')}\n"
-        f"{tf_line('1h')}\n"
-        f"{tf_line('4h')}\n"
-        f"{tf_line('1d')}\n"
-        "---------------------------------\n"
-        f"{prof_line}\n"
-        f"{final_opinion}"
-    )
-
-    # Flatten reasons for logging
-    reasons_flat: List[str] = []
-    for tf in ["15m", "1h", "4h", "1d"]:
-        for r in reasons_by_tf.get(tf, []):
-            reasons_flat.append(f"{tf}: {r}")
-    reasons_text = " | ".join(reasons_flat) if reasons_flat else "No Signal"
-
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN)
-        mark_alert(symbol)
-        await log_to_supabase(symbol, reasons_text, final_opinion)
-        log.info("Telegram alert sent for %s", symbol)
-    except Exception:
-        log.exception("Telegram error sending alert for %s", symbol)
-
-# ===================== Scanning & batching =====================
-async def scan_one_with_backoff(coin: str, btc_cache: Dict[str, List[float]]):
-    """Detect signals for one coin with rate-limit backoff."""
-    from config_and_utils import RateLimitError
-    max_attempts = 5
-    delay = 1
-    for attempt in range(max_attempts):
-        try:
-            reasons_by_tf, final_opinion, _, profiles = await detect_signals(coin, btc_1h_cache=btc_cache)
-            if reasons_by_tf:
-                await send_alert(coin, reasons_by_tf, final_opinion or "⚪ No edge", profiles)
-            await asyncio.sleep(SLEEP_TIME)
-            break
-        except RateLimitError as e:
-            ra = e.retry_after or delay
-            log.warning("Rate limit for %s. Retry after %s s (attempt %s)", coin, ra, attempt + 1)
-            await asyncio.sleep(ra)
-            delay = min(delay * 2, 60)
-        except Exception:
-            log.exception("Error with %s", coin)
-            break
-
-async def auto_add_new_listings(symbols: List[str]):
-    """Auto-add new USDT spot listings to watchlist (if enabled)."""
-    if not AUTO_ADD_NEW_COINS:
-        return
-    watchlist = await get_column("watchlist")
-    haram = await get_column("haram")
-    removed = await get_removed_map()
-    for s in symbols:
-        if s in haram or s in removed or s in watchlist:
-            continue
-        await add_coin_with_date("watchlist", s)
-
-async def _get_tradable_usdt_symbols() -> List[str]:
-    """Fetch and filter Binance spot USDT tradable symbols (excludes leveraged tokens)."""
-    exinfo = await get_exchange_info()
-    symbols = [
-        s["symbol"] for s in exinfo.get("symbols", [])
-        if s.get("quoteAsset") == "USDT"
-        and s.get("status") == "TRADING"
-        and s.get("isSpotTradingAllowed", True)
-    ]
-    # Exclude leveraged tokens
-    symbols = [c for c in symbols if not any(x in c for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])]
-    return symbols
-
-async def batch_scan_all_with_rate_limit():
-    """Scan all symbols in rate-limited batches. Pauses if FVG scan running."""
-    if FVG_SCAN_RUNNING:
-        log.info("Skipping normal scanning: FVG scan in progress")
-        await asyncio.sleep(30)
-        return
-
-    symbols = await _get_tradable_usdt_symbols()
-    await auto_add_new_listings(symbols)
-
-    from config_and_utils import BINANCE_BATCH_SIZE
-    log.info("Total %s USDT spot symbols. Scanning in batches of %s ...", len(symbols), BINANCE_BATCH_SIZE)
-
-    btc_cache: Dict[str, List[float]] = {}
-
-    for batch in chunked(symbols, BINANCE_BATCH_SIZE):
-        log.info("Scanning batch of %s coins...", len(batch))
-
-        async def limited_scan(coin):
-            if data_api.binance_sem is None:
-                log.error("binance_sem not initialized yet. Skipping %s", coin)
-                return
-            sem = data_api.binance_sem
-            async with sem:
-                await scan_one_with_backoff(coin, btc_cache)
-
-        tasks = [limited_scan(coin) for coin in batch]
-        await asyncio.gather(*tasks)
-        log.info("Sleeping 60 seconds for next batch...")
-        await asyncio.sleep(60)
-
-async def scanner_loop():
-    """Continuous scanning loop with error handling/backoff."""
-    while True:
-        try:
-            await batch_scan_all_with_rate_limit()
-        except Exception:
-            log.exception("Scanner loop error")
-            log.info("Sleeping 10 minutes...")
-            await asyncio.sleep(600)
 
 # ===================== Aggregator (5 times/day) =====================
 LAST_REPORT_SENT: Dict[str, datetime] = {}
@@ -293,6 +142,10 @@ async def top_gainer_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Failed to fetch: {e}")
 
 async def volatility_list_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Use fvg_coinlist.get_fvg_coins_async('1h') to compute volatility-based list.
+    This avoids depending on analysis.py.
+    """
     if not update.message or not update.message.text:
         return
     username = get_username(update)
@@ -309,20 +162,23 @@ async def volatility_list_handler(update: TGUpdate, context: ContextTypes.DEFAUL
         except Exception:
             top_n = 20
 
-    await update.message.reply_text(f"⏳ Computing top {top_n} high-volatility coins (1H)...")
+    await update.message.reply_text(f"⏳ Computing top {top_n} high-volatility coins (1H) using FVG filter...", parse_mode=ParseMode.MARKDOWN)
     try:
-        # Pass needed data_api functions to avoid circular deps
-        items = await volatility_coin_list(data_api.get_exchange_info, data_api.get_klines, top_n)
-        lines = [f"🌪️ Top {top_n} High Volatility (1H):", ""]
-        for i, (sym, vol) in enumerate(items, 1):
-            lines.append(f"{i:>2}. `{sym}` — Vol={vol:.4f}")
+        items = await get_fvg_coins_async("1h")
+        # items include 'volatility' key computed in fvg_coinlist
+        ranked = sorted(items, key=lambda x: float(x.get("volatility", 0.0)), reverse=True)
+        lines = [f"🌪️ Top {top_n} High Volatility (1H) (from FVG candidates):", ""]
+        for i, item in enumerate(ranked[:top_n], 1):
+            sym = item.get("symbol", "")
+            vol = float(item.get("volatility", 0.0))
+            lines.append(f"{i:>2}. `{sym}` — Vol={vol:.4f}  | Status: `{item.get('status','')}`")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
 # ===================== Telegram commands =====================
 async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Old version's /start restored to fix 'start is not defined'."""
+    """/start command"""
     if not update.message:
         return
     username = get_username(update)
@@ -341,7 +197,7 @@ async def start(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def status(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show watchlist/haram summary. Keep try/except robustness like old version."""
+    """Show watchlist/haram summary."""
     if not update.message:
         return
     try:
@@ -370,15 +226,9 @@ async def handle_commands(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) 
         return
     text = update.message.text.strip()
 
-    # FVG Coin List command (pauses normal scan while running)
-    # Accept custom timeframe prefix (e.g., "15m FVG Coin list", "4H FVG Coin list", "2h FVG Coin list")
+    # FVG Coin List command (delegated to fvg_coinlist handler)
     if re.search(r'^\s*[0-9]+[mMhHdDwW]\s*FVG\s*COIN\s*LIST\s*$', text, flags=re.IGNORECASE):
-        global FVG_SCAN_RUNNING
-        FVG_SCAN_RUNNING = True
-        try:
-            await fvg_coinlist_handler(update, context)
-        finally:
-            FVG_SCAN_RUNNING = False
+        await fvg_coinlist_handler(update, context)
         return
 
     # Special list commands
@@ -478,11 +328,10 @@ async def post_init(application):
         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         headers={"User-Agent": "CryptoWatchlistBot/2.0 (+contact)"}
     )
-    # Semaphore used in scanning — must be initialized before use
+    # Semaphore used by some data_api helpers (optional safety)
     data_api.binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    # Background tasks
-    application.create_task(scanner_loop())
+    # Background tasks: aggregator only (scanner removed since analysis.py is gone)
     application.create_task(aggregator_loop())
 
     logger.info("post_init completed: aiohttp session created and background tasks started.")
