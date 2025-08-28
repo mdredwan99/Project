@@ -3,17 +3,14 @@
 """
 Rule-based AI Regex + Keyword Router for Telegram commands.
 
-লক্ষ্য:
-- main.py তে আলাদা আলাদা কমান্ড এন্ট্রি যোগ করার দরকার না পড়ে।
-- ইনকামিং টেক্সট এলে এখানে সব রুল-চেক হবে এবং উপযুক্ত হ্যান্ডলার কল হবে।
-- অন্য ফাইলে থাকা হ্যান্ডলারও (যেমন fvg_coinlist_handler) এখানে রেফারেন্স ধরে কাজ করবে।
+This module centralizes the message routing rules and handlers so main.py can stay simple.
 """
 
 import re
 import asyncio
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
-from telegram import Update as TGUpdate
+from telegram import Update as TGUpdate, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, Application, filters
 from telegram.constants import ParseMode
 
@@ -21,10 +18,7 @@ from telegram.constants import ParseMode
 from config_and_utils import get_username, is_admin, logger
 from fvg_coinlist import fvg_coinlist_handler, parse_tf_command, get_fvg_coins_async
 from data_api import get_top_gainers
-from supabase import (
-    status_reply_text,
-    process_watchlist_action_text,  # parses "BTC ETH Check" etc and executes
-)
+from supabase import status_reply_text, process_watchlist_action_text
 
 # =============== Simple helpers ===============
 def _norm_text(text: Optional[str]) -> str:
@@ -111,12 +105,9 @@ async def volatility_list_handler(update: TGUpdate, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"❌ Failed: {e}")
 
 # =============== Rule-based Router ===============
-# Each rule is a function that, given (text), either returns a handler coroutine or None.
-
 async def _route_message(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Master router. Try rules in order—first match wins.
-    Falls back to watchlist action parser; if that fails, returns invalid.
+    Master router: tries exact commands, FVG commands, watchlist actions, then fallback.
     """
     if not update.message or not update.message.text:
         return
@@ -152,6 +143,7 @@ async def _route_message(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode=ParseMode.MARKDOWN
     )
 
+
 def setup_application(app: Application) -> None:
     """
     Register minimal handlers; the router does the rest.
@@ -159,4 +151,3 @@ def setup_application(app: Application) -> None:
     app.add_handler(CommandHandler("start", start))
     # Any text message goes through the router:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _route_message))
-    # You can add more generic fallbacks if needed
