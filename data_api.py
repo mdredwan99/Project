@@ -1,3 +1,5 @@
+# -*- CryptoICT AI -*-
+
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -5,8 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from config_and_utils import (
-    logger, BINANCE_BASE, MAX_CONCURRENCY, REQUEST_TIMEOUT,
-    supabase, binance_connector_client, RateLimitError
+    logger,
+    BINANCE_BASE,
+    MAX_CONCURRENCY,
+    REQUEST_TIMEOUT,
+    supabase,
+    binance_connector_client,
+    RateLimitError,
 )
 
 # Globals managed by main.post_init()
@@ -175,6 +182,7 @@ async def get_top_gainers(n=10, filtering_on=True) -> List[Tuple[str, float]]:
             sem = binance_sem
             async with sem:
                 pct = await get_ticker_24h(symbol)
+                # small throttle between requests to be polite
                 await asyncio.sleep(0.25)
             return (symbol, pct)
         except Exception:
@@ -241,7 +249,6 @@ def calc_hist_win_rate(symbol: str, interval: str, pump_pct=5.0, years: int = 5)
     """
     Calculates historical FVG win rate for the given symbol, interval, and TP%.
     Win = price pumps 'pump_pct'% above entry within 6 bars, SL = FVG bottom.
-    years: Number of years to analyze (default 5).
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
@@ -285,8 +292,7 @@ async def get_hist_win_rates(symbol: str) -> Dict[str, float]:
 # ===================== Market Cap =====================
 async def get_market_cap(symbol: str) -> Optional[float]:
     """
-    Get market cap for a given coin symbol.
-    Currently uses CoinGecko API (fallback).
+    Get market cap for a given coin symbol using CoinGecko (fallback).
     Returns value in USD if available.
     """
     global aiohttp_session
@@ -298,7 +304,8 @@ async def get_market_cap(symbol: str) -> Optional[float]:
         symbol_lower = symbol.replace("USDT", "").lower()
 
         url = f"https://api.coingecko.com/api/v3/coins/{symbol_lower}"
-        async with aiohttp_session.get(url, timeout=REQUEST_TIMEOUT) as resp:
+        # Use session timeout already configured in ClientSession
+        async with aiohttp_session.get(url) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
