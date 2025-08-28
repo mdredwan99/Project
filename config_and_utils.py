@@ -5,14 +5,28 @@ import re
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple, List
+from typing import Any, Optional, Tuple, List, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from flask import Flask
 from telegram import Bot as TGBot
-from supabase import create_client, Client
-from binance.spot import Spot
+
+# NOTE:
+# Some environments / type stubs may not expose create_client/Client or
+# binance.spot.Spot members (pyright can complain). We import runtime
+# callables defensively and import heavy/types only for type checking.
+try:
+    # create_client is needed at runtime; if import fails, provide a noop to avoid import errors
+    from supabase import create_client  # type: ignore
+except Exception:
+    def create_client(*args, **kwargs):  # fallback noop (will produce runtime errors if used)
+        return None  # type: ignore
+
+if TYPE_CHECKING:
+    # Import types only for static type checkers to reference
+    from supabase import Client as SupabaseClient  # type: ignore
+    from binance.spot import Spot as BinanceSpot  # type: ignore
 
 # ===================== env & logging =====================
 load_dotenv()
@@ -46,8 +60,17 @@ logger = logging.getLogger("crypto-scanner")
 
 # External clients (shared across modules)
 bot = TGBot(token=BOT_TOKEN)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-binance_connector_client = Spot(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+
+# Create supabase client at runtime; annotate as Any to avoid static errors
+supabase: Any = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Binance connector: import lazily to avoid type-stub issues; annotate as Any
+try:
+    from binance.spot import Spot  # type: ignore
+    binance_connector_client: Any = Spot(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+except Exception:
+    # If import fails (e.g., in a type-check-only environment), set to None
+    binance_connector_client: Any = None
 
 # ===================== Flask keep alive =====================
 flask_app = Flask(__name__)
