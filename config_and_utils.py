@@ -38,7 +38,7 @@ MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 SLEEP_TIME = float(os.getenv("SLEEP_TIME", "6"))
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "30"))
-USER_TZ = ZoneInfo(os.getenv("USER_TZ", "Asia/Dhaka"))  # UTC+6
+USER_TZ = ZoneInfo(os.getenv("USER_TZ", "Asia/Dhaka"))  # default UTC+6
 AUTO_ADD_NEW_COINS = os.getenv("AUTO_ADD_NEW_COINS", "false").lower() in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -60,7 +60,17 @@ def _run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 def keep_alive():
-    asyncio.get_event_loop().run_in_executor(None, _run_flask)
+    """
+    Run the Flask keep-alive server on a background thread/executor.
+    Called from main before starting the Telegram app.
+    """
+    try:
+        asyncio.get_event_loop().run_in_executor(None, _run_flask)
+    except RuntimeError:
+        # If no running loop (e.g., being executed in sync context), start the server in a new thread
+        import threading
+        t = threading.Thread(target=_run_flask, daemon=True)
+        t.start()
 
 # ===================== Exceptions =====================
 class RateLimitError(Exception):
@@ -71,11 +81,15 @@ class RateLimitError(Exception):
 
 # ===================== Telegram helpers =====================
 def get_username(update) -> str:
-    user = update.effective_user
-    return user.username or str(user.id) if user else "Unknown"
+    user = getattr(update, "effective_user", None)
+    if not user:
+        return "Unknown"
+    return user.username or str(user.id)
 
 def is_admin(username: Optional[str]) -> bool:
-    return bool(username) and username.lower() in ["redwanict", "growingbullspremium", "mdredwan2024"  ]
+    if not username:
+        return False
+    return username.lower() in ["redwanict", "growingbullspremium", "mdredwan2024"]
 
 def parse_command(text: str) -> Tuple[List[str], str]:
     if not text:
@@ -98,6 +112,7 @@ def parse_command(text: str) -> Tuple[List[str], str]:
         if tl in actions_map:
             found_action = actions_map[tl]
             continue
+        # Accept base symbols like BTC or full like BTCUSDT
         m = re.match(r'^([A-Za-z0-9]{2,10})(?:[/\-]?USDT)?$', t.upper())
         if m:
             base = m.group(1)
