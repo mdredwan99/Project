@@ -1,36 +1,31 @@
-# # -*- CryptoICT AI -*-
+# -*- CryptoICT AI -*-
 
 import asyncio
 import logging
-import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from telegram.constants import ParseMode
-from telegram import Update as TGUpdate
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder
 
+# keep_alive, shared clients & settings
 from config_and_utils import (
-    logger, keep_alive, bot, USER_TZ, CHAT_ID, SLEEP_TIME,
-    MAX_CONCURRENCY, REQUEST_TIMEOUT,
-    get_username, is_admin, parse_command, now_telegram_str, mark_alert
+    logger, keep_alive, bot, USER_TZ, CHAT_ID,
+    MAX_CONCURRENCY, REQUEST_TIMEOUT
 )
+
+# data layer
 import data_api
 from data_api import (
-    get_top_gainers, get_ticker_24h, get_exchange_info,
-    get_column, add_coin, add_coin_with_date, remove_coin_from_table, get_removed_map,
-    fetch_signals_since, log_to_supabase
+    fetch_signals_since, get_column, get_removed_map, get_ticker_24h
 )
-from fvg_coinlist import fvg_coinlist_handler, get_fvg_coins_async  # use fvg-only filtering
+
+# router & handlers (new rule-based system)
+import telegram as telegram_router  # our new telegram.py
+
 
 log = logging.getLogger("main")
-
-# ===================== Helpers =====================
-def chunked(lst: List[Any], n: int):
-    """Yield successive n-sized chunks from list."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
 
 # ===================== Aggregator (5 times/day) =====================
 LAST_REPORT_SENT: Dict[str, datetime] = {}
@@ -110,6 +105,48 @@ async def aggregator_loop():
                 msg = await _build_aggregated_message(window_end_local)
                 if msg:
                     try:
+                        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+                        log.info("Aggregator message sent for window %s", window_end_local.isoformat())
+                    except Exception:
+                        log.exception("Telegram send error in aggregator")
+
+                LAST_REPORT_SENT[agg_time_key] = now_local
+                await asyncio.sleep(70)
+            else:
+                await asyncio.sleep(20)
+        except Exception:
+            log.exception("Aggregator loop error")
+            await asyncio.sleep(30)
+
+# ===================== App bootstrap =====================
+async def post_init(application):
+    """Create shared aiohttp session & semaphore, then start background tasks."""
+    data_api.aiohttp_session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=100, ssl=False),
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        headers={"User-Agent": "CryptoWatchlistBot/2.0 (+contact)"}
+    )
+    data_api.binance_sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    # Background tasks
+    application.create_task(aggregator_loop())
+
+    logger.info("post_init completed: aiohttp session created and background tasks started.")
+
+def main() -> None:
+    """Entrypoint. Builds application and registers handlers via telegram router."""
+    keep_alive()
+    from config_and_utils import BOT_TOKEN
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Let the router set up all handlers (rule-based regex+keyword)
+    telegram_router.setup_application(app)
+
+    logger.info("Bot starting (press Ctrl+C to stop)...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()                    try:
                         await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
                         log.info("Aggregator message sent for window %s", window_end_local.isoformat())
                     except Exception:
