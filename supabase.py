@@ -4,7 +4,7 @@
 Supabase-facing helpers:
 - watchlist management commands (Check/Remove/Haram/Add again/Halal)
 - status text builder
-- (admin/members access hooks live here by wrapping config.is_admin if later expanded)
+- public entry used by the router
 """
 
 from typing import Any, Dict, List, Optional
@@ -13,9 +13,7 @@ from telegram import Update as TGUpdate
 from telegram.ext import ContextTypes
 
 from config_and_utils import logger, get_username, is_admin, parse_command
-from data_api import (
-    get_column, add_coin, add_coin_with_date, remove_coin_from_table, get_removed_map
-)
+from data_api import get_column, add_coin, add_coin_with_date, remove_coin_from_table, get_removed_map
 
 # =============== Status text ===============
 async def status_reply_text() -> str:
