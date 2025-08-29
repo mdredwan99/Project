@@ -2,11 +2,15 @@
 import asyncio
 import re
 import numpy as np
-from datetime import datetime
-from typing import Any, List, Sequence, Tuple, Optional, Dict
+from typing import Any, List, Sequence, Tuple, Optional, Dict, Protocol, cast
 from collections.abc import Mapping, Iterable as IterableABC
 
-from telegram import Update as TGUpdate, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update as TGUpdate,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message as TGMessage,
+)
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -18,15 +22,15 @@ from data_api import (
     get_market_cap,
 )
 
+# NEW: use watchlist actions via existing helper
+from supabase_helpers import process_watchlist_action_text
+
 
 # -----------------------------------------------------------------------
 # Configuration (tweak these to switch strict/relaxed behavior)
 # -----------------------------------------------------------------------
-ALLOW_PRIOR_BREAKOUTS: int = 3  # STRICT MODE: skip any FVG zone that had more than this many breakouts BEFORE inside
+ALLOW_PRIOR_BREAKOUTS: int = 3
 DEFAULT_KLINES_LOOKBACK = 200
-
-# If True, any wick/low that dips below gap_bottom will be treated as a breakdown.
-# If False, only candle closes below gap_bottom count as breakdowns (legacy behavior).
 TREAT_WICK_AS_BREAKDOWN: bool = True
 
 
@@ -214,7 +218,7 @@ def change_24h_from_series(closes: List[float], tf: str) -> float:
 # =========================================
 # ------- Bullish FVG core (strict) -------
 # =========================================
-
+# -------------- UNCHANGED -----------------
 def last_bullish_fvg_status(
     opens: List[float],
     highs: List[float],
@@ -222,21 +226,6 @@ def last_bullish_fvg_status(
     closes: List[float],
     allow_prior_breakouts: int = ALLOW_PRIOR_BREAKOUTS,
 ) -> Optional[Tuple[str, float, float, float, int]]:
-    """
-    Modified FVG detection to allow one breakout that happens AFTER price first enters the FVG (inside),
-    so that a first post-inside breakout can be considered a RESPECTED alert.
-
-    Rules (summary):
-    - Detect gap where lows[n] > highs[n-2]
-    - Require gap size >= 3%
-    - If any breakdown (wick/close depending on config) happens after gap creation -> skip zone
-    - Count breakouts that happen BEFORE the inside candle and skip zone if count > allow_prior_breakouts
-    - If price enters the FVG (inside) we detect that based on the BOTTOM of the body lying within the FVG:
-        body_low in [gap_bottom, gap_top] is considered "inside" (this matches examples where body dips into FVG)
-    - After inside, allow the first breakout AFTER inside to be the RESPECT candle (i.e., we permit it so zone can become RESPECTED)
-    - Avoid double pumps, breakdown after respect, etc.
-    Returns: ("INSIDE"|"RESPECTED", gap_bottom, gap_top, gap_size, fvg_idx) or None
-    """
     idxs: List[int] = []
     for n in range(2, len(highs)):
         if lows[n] > highs[n - 2]:
@@ -254,69 +243,52 @@ def last_bullish_fvg_status(
         if gap_size <= 0:
             continue
 
-        # size >= 3%
         if gap_bottom <= 0 or (gap_size / gap_bottom) < 0.03:
             continue
 
         mid = gap_bottom + 0.5 * gap_size
 
-        # scan for breakouts / breakdowns after gap creation
         breakout_idxs: List[int] = []
         breakdown_idxs: List[int] = []
         for i in range(n + 1, len(closes)):
             if closes[i] > gap_top and closes[i] > opens[i]:
                 breakout_idxs.append(i)
-            # breakdown detection: use lows (wick) if configured, otherwise use closes
             if (lows[i] < gap_bottom) if TREAT_WICK_AS_BREAKDOWN else (closes[i] < gap_bottom):
                 breakdown_idxs.append(i)
 
-        # STRICT RULE: if ANY breakdown occurred after gap creation -> skip zone forever!
         if breakdown_idxs:
             continue
 
-        # STRICT RULE: if ANY breakout already occurred after gap creation -> skip zone
         if len(breakout_idxs) > allow_prior_breakouts:
             continue
 
-        # defensive double pump avoid (if multiple breakouts detected)
         if len(breakout_idxs) > 1:
             continue
 
-        # breakdown then pump -> detect if any breakout happens after first breakdown
-        # (already covered by strict breakdown rule above, so not needed here)
-
-        # Freshness check: ensure no bullish pump happens before inside body formed
         pre_inside_respected = False
         for i in range(n + 1, len(closes)):
             body_low_i = min(opens[i], closes[i])
-            # if we find an inside body before any pump, stop freshness loop
             if body_low_i >= gap_bottom and body_low_i <= gap_top:
                 break
-            # pump before inside -> skip (pre-inside pump)
             if lows[i] <= mid and closes[i] > gap_top and closes[i] > opens[i]:
                 pre_inside_respected = True
                 break
         if pre_inside_respected:
             continue
 
-        # find an "inside" candle based on the BOTTOM of the body being within the zone
-        # (this allows examples like open=115, close=105 to be considered inside because body_low=105 ∈ [100,110])
         inside_idx: Optional[int] = None
         for i in range(n + 1, len(closes)):
             body_low = min(opens[i], closes[i])
-            # require the bottom of the body to lie within the FVG zone
             if body_low >= gap_bottom and body_low <= gap_top:
                 inside_idx = i
                 break
         if inside_idx is None:
             continue
 
-        # If there were breakouts before this inside, ensure they don't exceed allowed count
         breakouts_before_inside = [b for b in breakout_idxs if b < inside_idx]
         if len(breakouts_before_inside) > allow_prior_breakouts:
             continue
 
-        # Fail after inside: if price later dropped below gap_bottom -> skip
         failed_after_inside = False
         for k in range(inside_idx, len(closes)):
             if (lows[k] < gap_bottom) if TREAT_WICK_AS_BREAKDOWN else (closes[k] < gap_bottom):
@@ -325,50 +297,37 @@ def last_bullish_fvg_status(
         if failed_after_inside:
             continue
 
-        # respected after inside: allow any candle to touch mid first, 
-        # then later any bullish candle to breakout above gap_top
         respected = False
         respect_idx: Optional[int] = None
         mid_touched = False
 
         for i in range(inside_idx + 1, len(closes)):
-            # Step 1: check if mid level touched
             if lows[i] <= mid:
                 mid_touched = True
 
-            # Step 2: if mid was touched (earlier or this candle), check breakout
             if mid_touched and closes[i] > gap_top and closes[i] > opens[i]:
                 respected = True
                 respect_idx = i
                 break
 
-        # Now consider breakouts that happened AFTER inside
         breakouts_after_inside = [b for b in breakout_idxs if b >= inside_idx]
-        # If there were breakouts after inside but no respect was found - skip (we don't accept random post-inside breakouts)
         if breakouts_after_inside and respect_idx is None:
             continue
-        # If there are breakouts after inside and the first after-inside breakout is not the respect candle -> skip
         if breakouts_after_inside and respect_idx is not None:
             if breakouts_after_inside[0] != respect_idx:
                 continue
 
-        # double pump avoid after respect: now use FVG zone size % as threshold
         if respected and respect_idx is not None:
             double_after = False
-
-            # zone size percentage (relative to gap_bottom)
             zone_pct = (gap_top - gap_bottom) / gap_bottom
-
             for j in range(respect_idx + 1, len(closes)):
                 pump_pct = (closes[j] - gap_top) / gap_top
-                if pump_pct >= zone_pct:   # যদি FVG zone size% এর বেশি pump করে
+                if pump_pct >= zone_pct:
                     double_after = True
                     break
-
             if double_after:
                 continue
 
-        # Fail after respect: if any later low goes below gap_bottom -> invalidate respect
         if respected and respect_idx is not None:
             for k in range(respect_idx, len(closes)):
                 if (lows[k] < gap_bottom) if TREAT_WICK_AS_BREAKDOWN else (closes[k] < gap_bottom):
@@ -382,6 +341,7 @@ def last_bullish_fvg_status(
             return ("INSIDE", gap_bottom, gap_top, gap_size, n)
 
     return None
+# -------------- UNCHANGED -----------------
 
 
 # =========================================
@@ -405,6 +365,10 @@ def marketcap_category(mcap: Optional[float]) -> Tuple[str, str]:
 # =========================================
 
 async def analyze_fvg_win_rate(symbol: str, tf: str, opens: List[float], highs: List[float], lows: List[float], closes: List[float], fvg_bottom: float, fvg_top: float, fvg_idx: int) -> Dict[str, Any]:
+    """
+    Simplified win-rate analysis: keep the original 5% win-rate computation,
+    but remove the Best TP search and its extra calculations as requested.
+    """
     n = len(highs)
     zones: List[Tuple[int, float, float]] = []
     for i in range(2, max(3, n - 8)):
@@ -421,6 +385,7 @@ async def analyze_fvg_win_rate(symbol: str, tf: str, opens: List[float], highs: 
         sl = gb
         win = False
         for j in range(idx + 1, min(n, idx + 8)):
+            # keep the original 5% TP check for the win-rate calc
             if highs[j] >= entry * 1.05:
                 win = True
                 break
@@ -431,31 +396,9 @@ async def analyze_fvg_win_rate(symbol: str, tf: str, opens: List[float], highs: 
 
     win_rate = (sum(results) / len(results) * 100) if results else 0.0
 
-    best_tp: Optional[float] = None
-    best_rate = 0.0
-    for tp in np.arange(0.01, 0.12, 0.01):
-        tmp_results: List[bool] = []
-        for idx, gb, gt in zones:
-            entry = closes[idx]
-            sl = gb
-            win = False
-            for j in range(idx + 1, min(n, idx + 8)):
-                if highs[j] >= entry * (1 + tp):
-                    win = True
-                    break
-                if lows[j] < sl:
-                    win = False
-                    break
-            tmp_results.append(win)
-        rate = (sum(tmp_results) / len(tmp_results) * 100) if tmp_results else 0.0
-        if rate > best_rate:
-            best_tp = float(tp)
-            best_rate = float(rate)
-
+    # Return only the 5% win rate — do not compute Best TP or related success-rate.
     return {
         "win_rate_5pct": win_rate,
-        "best_tp_pct": round(best_tp * 100, 2) if best_tp is not None else None,
-        "best_tp_rate": round(best_rate, 2),
     }
 
 
@@ -510,7 +453,6 @@ async def get_fvg_coins_async(tf: str) -> List[Dict[str, Any]]:
 
                 status_fvg, gap_bottom, gap_top, gap_size, fvg_idx = fvg_info
 
-                # if current candle's low (or close, depending on config) is below gap_bottom, skip
                 current_below = (lows[-1] < gap_bottom) if TREAT_WICK_AS_BREAKDOWN else (closes[-1] < gap_bottom)
                 if current_below:
                     return None
@@ -592,16 +534,13 @@ def tradingview_link(symbol: str) -> str:
 
 
 def format_coin_message(c: Dict[str, Any], tf_label: str) -> str:
+    # win rate display: keep only the 5% win rate as requested
     win_txt = ""
     win_data = c.get("win_rate_analysis") or {}
     wr = win_data.get("win_rate_5pct", None)
-    tp = win_data.get("best_tp_pct", None)
-    tprate = win_data.get("best_tp_rate", None)
 
     if wr is not None:
         win_txt = win_txt + f"\n🏆 *FVG Win Rate*: `{wr:.2f}%`"
-    if tp is not None and tprate is not None:
-        win_txt = win_txt + f"\n🎯 *Best TP*: `{tp:.2f}%` | Success Rate: `{tprate:.2f}%`"
 
     signals: List[str] = []
     if c.get("rsi_div"):
@@ -613,16 +552,23 @@ def format_coin_message(c: Dict[str, Any], tf_label: str) -> str:
     if c.get("disp_candle"):
         signals.append("🔥 Displacement")
 
-    if signals:
-        extra_str = " | ".join(signals)
-    else:
-        extra_str = "—"
+    extra_str = " | ".join(signals) if signals else "—"
 
     avg_vol = c.get("avg_volume", 0)
     try:
         avg_vol_str = f"{int(avg_vol):,}"
     except Exception:
         avg_vol_str = str(avg_vol)
+
+    # prettier status labels with emoji for NEW / REMOVED / WATCHLIST
+    raw_status = c.get("status", "")
+    status_map = {
+        "NEW": "🆕 NEW",
+        "REMOVED": "🗑️ REMOVED",
+        "WATCHLIST": "⭐ WATCHLIST",
+        "HARAM": "🚫 HARAM",
+    }
+    status_display = status_map.get(raw_status, raw_status)
 
     msg = (
         f"🚀 `{c.get('symbol','')}` — {c.get('market_emoji','')} {c.get('market_cat','')} Market Cap"
@@ -634,7 +580,7 @@ def format_coin_message(c: Dict[str, Any], tf_label: str) -> str:
         f"\n📊 *Volatility*: `{c.get('volatility',0.0):.4f}`"
         f"\n📦 *Avg Volume*: `{avg_vol_str}`"
         f"\n📈 *24H Change*: `{c.get('change_24h',0.0):.2f}%`"
-        f"\n🔖 *Status*: `{c.get('status','')}`"
+        f"\n🔖 *Status*: `{status_display}`"
         f"\n🚦 Signals: {extra_str}"
         f"{win_txt}"
         f"\n━━━━━━━━━━━━━━"
@@ -644,79 +590,373 @@ def format_coin_message(c: Dict[str, Any], tf_label: str) -> str:
 
 
 # =========================================
-# ------- Custom Command System -----------
+# ------- Smart Parsing & Filters ----------
 # =========================================
 
-def parse_tf_command(text: str) -> Optional[Tuple[str, str]]:
-    # Regex case-insensitive, যাতে user 1m / 1M / 1h / 1d / 1w লিখলেও match হয়
-    m = re.match(r"^([0-9]+m|[0-9]+h|[0-9]+d|[0-9]+w|[0-9]+M)\s+FVG\s+COIN\s*LIST$", 
-                 text.strip(), re.IGNORECASE)
+def _parse_number_with_suffix(token: str) -> Optional[float]:
+    """e.g. '2m' -> 2_000_000; '750k' -> 750_000"""
+    m = re.match(r'^\s*([0-9]+(?:\.[0-9]+)?)\s*([kmbKMB])?\s*$', token)
     if not m:
         return None
+    val = float(m.group(1))
+    suf = (m.group(2) or '').lower()
+    if suf == 'k':
+        val *= 1_000
+    elif suf == 'm':
+        val *= 1_000_000
+    elif suf == 'b':
+        val *= 1_000_000_000
+    return val
 
-    tf_label = m.group(1)  # match capture (যেমন 1m, 1M, 4h ইত্যাদি)
+def parse_filters(text: str) -> Dict[str, Any]:
+    raw = text.lower()
 
-    # smart mapping: 1M মানে Month, ছোট m মানে Minute
-    if tf_label.endswith("M") and tf_label.isupper():
-        tf = tf_label   # যেমন 1M → মাস
-    else:
-        tf = tf_label.lower()  # যেমন 1m → মিনিট, 1h → ঘন্টা, 1d → দিন, 1w → সপ্তাহ
+    # defaults
+    cfg = {
+        "top_n": None,                 # int
+        "only_respected": False,       # True -> RESPECTED only
+        "inside_only": False,          # True -> INSIDE only
+        "high_volume": False,          # True -> top volume quartile
+        "min_volume": None,            # float absolute
+        "watchlist_only": False,       # only symbols already in watchlist
+        "sort_by": "default",          # default|wr|gap|rs|vol|change|mcap
+    }
 
-    return tf_label.upper(), tf
+    # top N
+    m = re.search(r'\btop\s+(\d{1,3})\b', raw)
+    if m:
+        cfg["top_n"] = max(1, min(100, int(m.group(1))))
+
+    # respected / inside
+    if re.search(r'\b(strong|respected)\b', raw):
+        cfg["only_respected"] = True
+    if re.search(r'\binside\s+only\b', raw):
+        cfg["inside_only"] = True
+
+    # volume filters
+    if re.search(r'\bhigh\s+vol(ume)?\b', raw):
+        cfg["high_volume"] = True
+    m2 = re.search(r'\bmin\s+vol(ume)?\s+([0-9]+(?:\.[0-9]+)?[kmbKMB]?)\b', raw)
+    if m2:
+        val = _parse_number_with_suffix(m2.group(2))
+        if val is not None:
+            cfg["min_volume"] = float(val)
+
+    # watchlist only
+    if re.search(r'\bwatchlist\s+only\b', raw):
+        cfg["watchlist_only"] = True
+
+    # sorting
+    m3 = re.search(r'\bsort\s+(wr|gap|rs|vol|change|mcap)\b', raw)
+    if m3:
+        cfg["sort_by"] = m3.group(1)
+
+    return cfg
+
+
+def smart_parse_tf(text: str) -> Optional[Tuple[str, str]]:
+    """
+    Smart/Fuzzy TF parser.
+    Returns (TF_LABEL, tf_key) like ("4H", "4h")
+    """
+    raw = text.strip()
+
+    # Original strict format first (kept for backward compatibility)
+    strict = re.match(
+        r"^([0-9]+m|[0-9]+h|[0-9]+d|[0-9]+w|[0-9]+M)\s+FVG\s+COIN\s*LIST$",
+        raw, re.IGNORECASE
+    )
+    if strict:
+        tf_label = strict.group(1)
+        tf = tf_label if (tf_label.endswith("M") and tf_label.isupper()) else tf_label.lower()
+        return tf_label.upper(), tf
+
+    s = raw.lower()
+
+    # Must mention 'fvg' to qualify as this command family
+    if "fvg" not in s:
+        return None
+
+    # Flexible phrases
+    pairs = [
+        (r'\b15\s*m(in)?\b', ("15M", "15m")),
+        (r'\b30\s*m(in)?\b', ("30M", "30m")),
+        (r'\b45\s*m(in)?\b', ("45M", "45m")),
+        (r'\b1\s*h(our)?\b', ("1H", "1h")),
+        (r'\b4\s*h(our)?\b', ("4H", "4h")),
+        (r'\b1\s*d(ay)?\b', ("1D", "1d")),
+        (r'\b1\s*w(eek|k)?\b', ("1W", "1w")),
+    ]
+    for pat, tfpair in pairs:
+        if re.search(pat, s):
+            return tfpair
+
+    # If only “fvg” found but no TF -> ask user via keyboard (handled by handler)
+    return None
+
+
+def build_tf_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("1H", callback_data="FVG_TF|1H"),
+            InlineKeyboardButton("4H", callback_data="FVG_TF|4H"),
+            InlineKeyboardButton("1D", callback_data="FVG_TF|1D"),
+        ],
+        [
+            InlineKeyboardButton("15m", callback_data="FVG_TF|15M"),
+            InlineKeyboardButton("30m", callback_data="FVG_TF|30M"),
+            InlineKeyboardButton("1W", callback_data="FVG_TF|1W"),
+        ]
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 # =========================================
-# --------- Telegram Handler --------------
+# ------- Telegram Handler (SMART) --------
 # =========================================
 
-async def fvg_coinlist_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
+# Protocol for anything with 'reply_text' used by _scan_and_send
+class MessageSender(Protocol):
+    async def reply_text(self, text: str, **kwargs: Any) -> Any:
+        ...
 
-    text = update.message.text.strip()
-    tf_parse = parse_tf_command(text)
-    if not tf_parse:
-        await update.message.reply_text(
-            "⚠️ Invalid command format!\n📝 Example: `4H FVG Coin list` or `15m FVG Coin list`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
 
-    tf_label, tf = tf_parse
+async def _scan_and_send(sender: MessageSender, context: ContextTypes.DEFAULT_TYPE, tf_label: str, tf_key: str, filters: Optional[Dict[str, Any]] = None) -> None:
+    """Core routine: scan, filter/sort, send results + summary."""
+    filters = filters or {}
 
-    await update.message.reply_text(
+    # initial message
+    await sender.reply_text(
         f"⏳ Scanning Binance ({tf_label}) FVG coins...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    coins = await get_fvg_coins_async(tf)
-
+    coins = await get_fvg_coins_async(tf_key)
     if not coins:
-        await update.message.reply_text(
+        await sender.reply_text(
             f"😔 No coins matched the criteria for {tf_label}. Try again later.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    def coin_sort_key(c: Dict[str, Any]) -> Tuple[int, float]:
+    # Apply filters
+    data = coins
+
+    if filters.get("only_respected"):
+        data = [c for c in data if c.get("fvg_status") == "RESPECTED"]
+    if filters.get("inside_only"):
+        data = [c for c in data if c.get("fvg_status") == "INSIDE"]
+    if filters.get("watchlist_only"):
+        data = [c for c in data if c.get("status") == "WATCHLIST"]
+    if filters.get("min_volume") is not None:
+        mv = float(filters["min_volume"])
+        data = [c for c in data if float(c.get("avg_volume", 0)) >= mv]
+    if filters.get("high_volume"):
+        vols = [float(c.get("avg_volume", 0)) for c in data]
+        if vols:
+            thr = sorted(vols)[int(0.75 * (len(vols)-1))]  # ~top quartile
+            data = [c for c in data if float(c.get("avg_volume", 0)) >= thr]
+
+    # Sorting
+    def coin_sort_key_default(c: Dict[str, Any]) -> Tuple[int, float]:
         wr = (c.get("win_rate_analysis") or {}).get("win_rate_5pct", 0.0)
         respected = 1 if c.get("fvg_status") == "RESPECTED" else 0
         return respected, float(wr or 0.0)
 
-    coins.sort(key=coin_sort_key, reverse=True)
+    sort_by = filters.get("sort_by", "default")
+    if sort_by == "default":
+        data.sort(key=coin_sort_key_default, reverse=True)
+    elif sort_by == "wr":
+        data.sort(key=lambda c: float((c.get("win_rate_analysis") or {}).get("win_rate_5pct") or 0.0), reverse=True)
+    elif sort_by == "gap":
+        data.sort(key=lambda c: float(c.get("gap_size_pct", 0.0)), reverse=True)
+    elif sort_by == "rs":
+        data.sort(key=lambda c: float(c.get("rs_val", 0.0)), reverse=True)
+    elif sort_by == "vol":
+        data.sort(key=lambda c: float(c.get("avg_volume", 0.0)), reverse=True)
+    elif sort_by == "change":
+        data.sort(key=lambda c: float(c.get("change_24h", 0.0)), reverse=True)
+    elif sort_by == "mcap":
+        data.sort(key=lambda c: float(c.get("market_cap") or 0.0), reverse=True)
 
-    for c in coins:
+    # top N limit
+    top_n = filters.get("top_n")
+    if isinstance(top_n, int) and top_n > 0:
+        data = data[: top_n]
+
+    # Send rows
+    respected_cnt = 0
+    inside_cnt = 0
+
+    for c in data:
+        if c.get("fvg_status") == "RESPECTED":
+            respected_cnt += 1
+        elif c.get("fvg_status") == "INSIDE":
+            inside_cnt += 1
+
         msg = format_coin_message(c, tf_label)
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Chart", url=tradingview_link(c.get("symbol", "")))]])
+
+        symbol = c.get("symbol", "")
+        status = c.get("status", "")
+        is_watch = (status == "WATCHLIST")
+        # removed unused is_haram assignment to avoid linter warning
+
+        wl_buttons = []
+        if is_watch:
+            wl_buttons.append(InlineKeyboardButton("➖ Remove WL", callback_data=f"WL|REMOVE|{symbol}"))
+        else:
+            wl_buttons.append(InlineKeyboardButton("➕ Add WL", callback_data=f"WL|ADD|{symbol}"))
+
+        # Removed the Haram/Halal button from message options as requested.
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Chart", url=tradingview_link(symbol))],
+            wl_buttons
+        ])
+
         try:
-            await update.message.reply_text(
-                msg + f"\n🔲 FVG Zone: `{c.get('fvg_zone_text','')}`",
+            await sender.reply_text(
+                msg,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
             )
         except Exception:
-            await update.message.reply_text(
-                msg + f"\n🔲 FVG Zone: `{c.get('fvg_zone_text','')}`",
+            await sender.reply_text(
+                msg,
                 parse_mode=ParseMode.MARKDOWN,
             )
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.25)
+
+    # Summary
+    await sender.reply_text(
+        f"📌 *Summary* — {tf_label}\n"
+        f"• Total: `{len(data)}`\n"
+        f"• RESPECTED: `{respected_cnt}`\n"
+        f"• INSIDE: `{inside_cnt}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def fvg_coinlist_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    message = update.message
+    text = cast(str, message.text).strip()
+
+    # Parse filters first (they do not affect detection, only view)
+    filters = parse_filters(text)
+
+    # Smart timeframe parsing (backward compatible)
+    tf = smart_parse_tf(text)
+
+    if not tf:
+        # If message mentions FVG but TF missing -> suggest with keyboard
+        if re.search(r'\bfvg\b', text, re.IGNORECASE):
+            await message.reply_text(
+                "🧠 Choose a timeframe for FVG scan:",
+                reply_markup=build_tf_keyboard()
+            )
+            return
+
+        # Otherwise show smart suggestion
+        await message.reply_text(
+            "⚠️ Couldn’t parse your command.\n"
+            "Examples:\n"
+            "• `4H FVG Coin List`\n"
+            "• `show 1d fvg top 10 strong only sort wr`\n"
+            "• `fvg 4h high volume min volume 2m`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    tf_label, tf_key = tf
+    # Pass message object as the 'sender' so _scan_and_send can reply via same message context
+    await _scan_and_send(cast(MessageSender, message), context, tf_label, tf_key, filters=filters)
+
+
+# =========================================
+# ------------- Callback Handlers ----------
+# =========================================
+
+async def fvg_tf_callback_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle timeframe selection from inline keyboard."""
+    if not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+
+    # query.message can be None (MaybeInaccessibleMessage) — check and bail if missing
+    if query.message is None:
+        try:
+            await query.edit_message_text("⚠️ Unable to run scan: original message not available.")
+        except Exception:
+            pass
+        return
+
+    # Cast to TGMessage before using members
+    qmsg = cast(TGMessage, query.message)
+
+    data = (query.data or "")
+    # Expected: FVG_TF|1H
+    m = re.match(r'^FVG_TF\|([0-9]+[mMhHdDwW])$', data)
+    if not m:
+        await qmsg.reply_text("⚠️ Invalid TF selection.")
+        return
+
+    tf_label = m.group(1).upper()
+    # Normalize into key
+    tf_key = tf_label if (tf_label.endswith("M") and tf_label.isupper()) else tf_label.lower()
+
+    # Inform user and then run scan, using the callback message as sender
+    await qmsg.reply_text(f"⏳ Scanning Binance ({tf_label}) FVG coins...", parse_mode=ParseMode.MARKDOWN)
+
+    # Cast the message object to TGMessage (helps static checkers)
+    sender_msg = cast(TGMessage, query.message)
+    await _scan_and_send(cast(MessageSender, sender_msg), context, tf_label, tf_key, filters={})
+
+
+async def watchlist_callback_handler(update: TGUpdate, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Add/Remove/Haram/Halal buttons."""
+    if not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+
+    if query.message is None:
+        try:
+            await query.edit_message_text("⚠️ Unable to perform action: original message not available.")
+        except Exception:
+            pass
+        return
+
+    qmsg = cast(TGMessage, query.message)
+
+    data = (query.data or "")
+    # Expected: WL|ADD|BTCUSDT  / WL|REMOVE|BTCUSDT / WL|HARAM|... / WL|HALAL|...
+    m = re.match(r'^WL\|(ADD|REMOVE|HARAM|HALAL)\|([A-Z0-9]+)$', data)
+    if not m:
+        await qmsg.reply_text("⚠️ Invalid action.")
+        return
+
+    action, symbol = m.group(1), m.group(2)
+    # Compose a command string that the existing helper understands
+    cmd_map = {
+        "ADD":    f"{symbol} Add",
+        "REMOVE": f"{symbol} Remove",
+        "HARAM":  f"{symbol} Haram",
+        "HALAL":  f"{symbol} Halal",
+    }
+    cmd_text = cmd_map[action]
+
+    try:
+        # Reuse existing permission logic & DB ops
+        # process_watchlist_action_text expects (update, text) in original design,
+        # so we call it with the original update (callback update) and the command text.
+        reply = await process_watchlist_action_text(update, cmd_text)
+        if reply:
+            await qmsg.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await qmsg.reply_text("ℹ️ No change.")
+    except Exception as e:
+        await qmsg.reply_text(f"❌ Failed: {e}")
